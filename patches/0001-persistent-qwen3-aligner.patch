@@ -1,0 +1,70 @@
+diff --git a/src/crispasr_aligner.cpp b/src/crispasr_aligner.cpp
+index 9d85e5b..dd9a8c5 100755
+--- a/src/crispasr_aligner.cpp
++++ b/src/crispasr_aligner.cpp
+@@ -275,3 +275,65 @@ std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner
+     }
+     return out;
+ }
++
++// ─── persistent qwen3 forced-aligner (added for qwen_asr_cpp) ────────────────
++//
++// The stock crispasr_align_words() reloads the aligner GGUF on every call.
++// For per-segment streaming alignment we want the aligner resident: open it
++// once, reuse its qwen3_asr_context across many segments, close at the end.
++// These are extern "C" + default-visibility so they export from libcrispasr.so.
++extern "C" {
++
++struct crispasr_paligner {
++    qwen3_asr_context* ctx = nullptr;
++};
++
++__attribute__((visibility("default")))
++crispasr_paligner* crispasr_paligner_open(const char* model_path, int n_threads) {
++    if (!model_path) return nullptr;
++    qwen3_asr_context_params cp = qwen3_asr_context_default_params();
++    cp.n_threads = n_threads > 0 ? n_threads : 4;
++    cp.verbosity = 0;
++    qwen3_asr_context* ctx = qwen3_asr_init_from_file(model_path, cp);
++    if (!ctx) {
++        fprintf(stderr, "crispasr_paligner: failed to load '%s'\n", model_path);
++        return nullptr;
++    }
++    int dim = qwen3_asr_lm_head_dim(ctx);
++    if (dim == 0 || dim > 10000) {
++        fprintf(stderr, "crispasr_paligner: '%s' lm_head dim %d (expected ~5000 forced-aligner)\n",
++                model_path, dim);
++        qwen3_asr_free(ctx);
++        return nullptr;
++    }
++    auto* a = new crispasr_paligner();
++    a->ctx = ctx;
++    return a;
++}
++
++// Align `words` (n_words char* ptrs) to `samples`; writes per-word centisecond
++// timings (offset by t_offset_cs) into out_t0_cs/out_t1_cs. Returns 0 on success.
++__attribute__((visibility("default")))
++int crispasr_paligner_align(crispasr_paligner* a, const char** words, int n_words,
++                            const float* samples, int n_samples, int64_t t_offset_cs,
++                            int64_t* out_t0_cs, int64_t* out_t1_cs) {
++    if (!a || !a->ctx || !words || n_words <= 0 || !samples || !out_t0_cs || !out_t1_cs)
++        return -1;
++    std::vector<int64_t> sms(n_words, 0), ems(n_words, 0);
++    int rc = qwen3_asr_align_words(a->ctx, samples, n_samples, words, n_words, sms.data(), ems.data());
++    if (rc != 0) return rc;
++    for (int i = 0; i < n_words; i++) {
++        out_t0_cs[i] = t_offset_cs + sms[i] / 10;  // ms -> cs
++        out_t1_cs[i] = t_offset_cs + ems[i] / 10;
++    }
++    return 0;
++}
++
++__attribute__((visibility("default")))
++void crispasr_paligner_close(crispasr_paligner* a) {
++    if (!a) return;
++    if (a->ctx) qwen3_asr_free(a->ctx);
++    delete a;
++}
++
++}  // extern "C"

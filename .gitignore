@@ -1,0 +1,15 @@
+# build artifacts
+/build/
+
+# models (large GGUF weights)
+/models/
+*.gguf
+
+# large test media (imported locally for testing; too big for git).
+# Small 30s fixtures under tests/fixtures/ are kept.
+/tests/data/
+
+# editor / OS
+*.o
+*.swp
+.DS_Store
