@@ -14,13 +14,26 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DEBS="$HERE/debs"
 
+# CUDA toolkit package. The GPU build needs CUDA >= 12 for Ada/sm_89 (RTX 40xx).
+# Distro `nvidia-cuda-toolkit` is 12.0 on 24.04 (OK) but only 11.5 on 22.04 (too
+# old for sm_89) — so prefer NVIDIA's repo `cuda-toolkit-12-4` when available.
+# Override with CUDA_PKG=<name>, or CUDA_PKG=none to skip (CPU-only target).
+CUDA_PKG="${CUDA_PKG:-auto}"
+if [ "$CUDA_PKG" = auto ]; then
+    if apt-cache show cuda-toolkit-12-4 >/dev/null 2>&1; then CUDA_PKG=cuda-toolkit-12-4
+    elif apt-cache show nvidia-cuda-toolkit >/dev/null 2>&1; then CUDA_PKG=nvidia-cuda-toolkit
+    else CUDA_PKG=none; fi
+fi
+
 # Top-level packages we explicitly need:
 #   g++, g++-12, gcc-12  -> compilers (g++-12 is the CUDA host compiler)
 #   make, cmake          -> build
 #   ffmpeg               -> runtime media decode
 #   git, curl, ca-certificates -> submodules / model download / TLS
-#   nvidia-cuda-toolkit  -> nvcc + CUDA dev/runtime libs (cublas, cudart)
-PKGS=(g++ g++-12 gcc-12 make cmake ffmpeg git curl ca-certificates nvidia-cuda-toolkit)
+#   $CUDA_PKG            -> nvcc + CUDA dev/runtime libs (cublas, cudart)
+PKGS=(g++ g++-12 gcc-12 make cmake ffmpeg git curl ca-certificates)
+[ "$CUDA_PKG" != none ] && PKGS+=("$CUDA_PKG")
+echo ">> CUDA toolkit package: ${CUDA_PKG} (override with CUDA_PKG=...)"
 
 . /etc/os-release
 ARCH="$(dpkg --print-architecture)"

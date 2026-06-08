@@ -11,21 +11,13 @@
 # and is the easiest way to get the forced-aligner GGUF the SRT path wants.
 #
 # Usage:
-#   scripts/get_model.sh                 # 1.7B ASR + 0.6B aligner, both q8_0
+#   scripts/get_model.sh                 # every variant of 1.7B ASR + 0.6B aligner
 #   SIZE=0.6b scripts/get_model.sh       # smaller/faster 0.6B ASR
-#   ASR_QUANT=q4_k scripts/get_model.sh  # configure ASR / aligner quant separately
-#   ALIGNER_QUANT=f16 scripts/get_model.sh
-#   QUANT=q4_k scripts/get_model.sh      # set both at once
-#   ALL=1 scripts/get_model.sh           # every quant variant of both models
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODELS="$ROOT/models"
 SIZE="${SIZE:-1.7b}"                       # 1.7b (best accuracy) | 0.6b
-QUANT="${QUANT:-q8_0}"                     # master default for both
-ASR_QUANT="${ASR_QUANT:-$QUANT}"           # ASR quantization     (default q8_0)
-ALIGNER_QUANT="${ALIGNER_QUANT:-$QUANT}"   # aligner quantization (default q8_0)
-ALL="${ALL:-0}"                            # 1 -> grab every variant below
 
 ASR_REPO="cstr/qwen3-asr-${SIZE}-GGUF"
 ALN_REPO="cstr/qwen3-forced-aligner-0.6b-GGUF"
@@ -43,13 +35,10 @@ fetch() {  # repo, file
     curl -L --fail --retry 3 -o "$out" "https://huggingface.co/$1/resolve/main/$2"
 }
 
-if [[ "$ALL" == "1" ]]; then
-    for q in $ASR_VARIANTS; do fetch "$ASR_REPO" "qwen3-asr-${SIZE}-${q}.gguf"; done
-    for q in $ALN_VARIANTS; do fetch "$ALN_REPO" "qwen3-forced-aligner-0.6b-${q}.gguf"; done
-else
-    fetch "$ASR_REPO" "qwen3-asr-${SIZE}-${ASR_QUANT}.gguf"
-    fetch "$ALN_REPO" "qwen3-forced-aligner-0.6b-${ALIGNER_QUANT}.gguf"
-fi
+# Always grab every published variant of both models (existing files are skipped
+# by fetch()).
+for q in $ASR_VARIANTS; do fetch "$ASR_REPO" "qwen3-asr-${SIZE}-${q}.gguf"; done
+for q in $ALN_VARIANTS; do fetch "$ALN_REPO" "qwen3-forced-aligner-0.6b-${q}.gguf"; done
 
 # Silero VAD model — used by vad-mode segmentation. Kept in models/ so the app
 # never has to auto-download into a cache.

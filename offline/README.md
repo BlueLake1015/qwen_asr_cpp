@@ -18,9 +18,15 @@ offline/download_debs.sh        # fills offline/debs/ with the full dependency c
 ```
 
 Bundles build tools (`g++`, `g++-12`, `gcc-12`, `make`, `cmake`), `ffmpeg`,
-`git`/`curl`, and the **CUDA toolkit** (`nvidia-cuda-toolkit` → `nvcc` + cuBLAS/
-cuDART), plus every recursive dependency. Writes `manifest.txt` and `target.txt`
-(the release/arch the bundle targets).
+`git`/`curl`, and the **CUDA toolkit** (`nvcc` + cuBLAS/cuDART), plus every
+recursive dependency. Writes `manifest.txt` and `target.txt` (release/arch).
+
+> **CUDA package selection.** The Ada/`sm_89` GPU (RTX 40xx) needs CUDA ≥ 12.
+> The script auto-picks `cuda-toolkit-12-4` (from NVIDIA's CUDA apt repo) when
+> available, else falls back to distro `nvidia-cuda-toolkit` — which is fine on
+> Ubuntu 24.04 (12.0) but **too old on 22.04 (11.5)**. So on a 22.04 online host,
+> add NVIDIA's CUDA repo first (so `cuda-toolkit-12-4` resolves). Override with
+> `CUDA_PKG=<name>`, or `CUDA_PKG=none` for a CPU-only bundle.
 
 > The NVIDIA **driver** is *not* bundled — the GPU target is assumed to already
 > have a working driver (`nvidia-smi` runs). Driver installs need a matching
@@ -50,7 +56,10 @@ build/qwen-asr tests/fixtures/test_en_30s.mp4 -o out.srt -l en
 
 `install.sh` warns if the host's Ubuntu/arch doesn't match the bundle, runs two
 `dpkg -i` passes (self-contained closure, no downloads), and checks for
-`g++/g++-12/make/cmake/ffmpeg/nvcc` + the GPU driver.
+`g++/g++-12/make/cmake/ffmpeg/nvcc` + the GPU driver. The CUDA toolkit installs to
+`/usr/local/cuda-XX/bin` (not on `PATH`), so `install.sh` also writes
+`/etc/profile.d/cuda.sh` to expose `nvcc` for the build (re-login or `source` it).
+Test/relocate the bundle with `DEBS_DIR=<path> offline/install.sh`.
 
 ## Notes
 

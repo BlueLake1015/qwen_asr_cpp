@@ -11,7 +11,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-DEBS="$HERE/debs"
+DEBS="${DEBS_DIR:-$HERE/debs}"      # override with DEBS_DIR=<path> (e.g. for testing)
 
 [ -d "$DEBS" ] && ls "$DEBS"/*.deb >/dev/null 2>&1 || {
     echo "error: no .debs in $DEBS — run offline/download_debs.sh on an online host first." >&2
@@ -37,6 +37,17 @@ sudo dpkg -i "$DEBS"/*.deb || {
     exit 1
 }
 
+# The CUDA toolkit installs to /usr/local/cuda-XX/bin, which is NOT on PATH.
+# Expose it for this shell + future logins so cmake/nvcc are found by `make`.
+CUDA_BIN="$(ls -d /usr/local/cuda-*/bin 2>/dev/null | sort -V | tail -1)"
+if [ -n "$CUDA_BIN" ]; then
+    export PATH="$CUDA_BIN:$PATH"
+    if [ ! -f /etc/profile.d/cuda.sh ]; then
+        echo "export PATH=$CUDA_BIN:\$PATH" | sudo tee /etc/profile.d/cuda.sh >/dev/null 2>&1 \
+            && echo ">> wrote /etc/profile.d/cuda.sh ($CUDA_BIN added to PATH; re-login or 'source' it)"
+    fi
+fi
+
 echo ">> verifying toolchain ..."
 miss=0
 for t in g++ g++-12 make cmake ffmpeg git curl nvcc; do
@@ -44,5 +55,10 @@ for t in g++ g++-12 make cmake ffmpeg git curl nvcc; do
 done
 echo ">> GPU driver check:"; nvidia-smi -L 2>/dev/null || echo "   (no nvidia-smi — install the NVIDIA driver separately; needed for GPU inference)"
 
-[ "$miss" -eq 0 ] && echo ">> environment ready. Next: cd $ROOT && make" \
-                  || { echo ">> $miss tool(s) missing — see warnings above." >&2; exit 1; }
+if [ "$miss" -eq 0 ]; then
+    echo ">> environment ready. Next:"
+    [ -n "$CUDA_BIN" ] && echo "     export PATH=$CUDA_BIN:\$PATH    # if nvcc isn't on PATH in this shell yet"
+    echo "     cd $ROOT && make                 # (or: make GPU=off for CPU-only)"
+else
+    echo ">> $miss tool(s) missing — see warnings above." >&2; exit 1
+fi
