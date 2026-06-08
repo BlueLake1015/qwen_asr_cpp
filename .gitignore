@@ -13,3 +13,8 @@
 *.o
 *.swp
 .DS_Store
+# offline apt bundle (large; regenerate with offline/download_debs.sh)
+/offline/debs/
+/offline/manifest.txt
+/offline/target.txt
+/offline/*.gz
