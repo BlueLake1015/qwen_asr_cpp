@@ -51,6 +51,7 @@ mapfile -t DEPS < <(
         --no-conflicts --no-breaks --no-replaces --no-enhances "${PKGS[@]}" \
     | grep -E '^[a-zA-Z0-9]' | grep -v -- '<' \
     | grep -vE '^(libnvidia-|nvidia-(compute|driver|kernel|dkms|utils|settings)|xserver-xorg-video-nvidia|libgl1-nvidia)' \
+    | grep -vE '^(libav(codec|format|filter|device|util|resample)-extra|liboss4-salsa-asound2|libjack0)' \
     | sort -u
 )
 echo ">> ${#DEPS[@]} packages in closure (driver libs excluded); downloading .debs ..."
