@@ -23,7 +23,7 @@ runtime; media decoding is delegated to the external **ffmpeg** command.
 | **ASR model** | [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) 1.7B (default) or 0.6B — latest open Qwen ASR series, 52 languages |
 | **Timestamps** | [Qwen3-ForcedAligner-0.6B](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) CTC forced alignment |
 | **Engine** | [CrispASR](https://github.com/CrispStrobe/CrispASR) (pure C++/ggml, no Python), vendored submodule; ggml in-tree |
-| **Compute** | **GPU/CUDA by default** (RTX 4090: ~5× realtime on 1.7B); `make GPU=off` for CPU |
+| **Compute** | **GPU/CUDA by default** (RTX 4090: ~20× realtime inference on 1.7B q8, greedy); `make GPU=off` for CPU |
 | **Build** | GNU Make (drives the engine's CMake build) |
 
 ---
@@ -187,12 +187,16 @@ build/qwen-asr udp://239.0.0.1:5000 --mode vad --json -l en
     --backend <name>    force backend: qwen3 | qwen3-1.7b   (default: auto-detect from GGUF)
 -l, --language <code>   language hint (en, zh, ko, …)        (default: auto)
 -t, --threads <n>       inference/host threads               (default 4)
+-bs, --beam-size <n>    decode beam width; 1 = greedy (default, fast). >1 enables
+                        beam search: ~Nx slower decode for little ASR accuracy gain
 --mode <m>              offline (default) | fixed | vad
 --segment-seconds <s>   fixed-mode window length             (default 10)
 --segment-step <s>      fixed-mode window step               (default: engine ~3s)
 --vad-threshold <f>     vad speech probability threshold     (default ~0.5)
 --min-silence-ms <n>    vad silence that splits a segment
 --min-speech-ms <n>     vad minimum speech kept
+--vad-max-segment <s>   vad+aligned: cap each speech chunk (s); 0 (default) → use
+                        --segment-seconds. Lower = less VRAM, slight accuracy cost
 --vad-model <path>      VAD model (default: models/ggml-silero-v6.2.0.bin)
 --aligned               fixed/vad: per-segment forced-aligner pass (resident models, accurate SRT)
 --json                  streaming: emit --stream-json partial/final/silence events
@@ -351,11 +355,27 @@ Verified behavior — both models load once, then segments stream:
 - Vulkan / Metal: pass the matching `-DGGML_VULKAN=ON` / `-DGGML_METAL=ON` (see
   CrispASR docs) — the `crispasr_capi`/exec paths are backend-agnostic.
 
+- **Decoding defaults to greedy (`--beam-size 1`).** The engine's own default is
+  5-way beam search, which does ~5× the decode work for little ASR accuracy gain;
+  the wrapper overrides it to greedy for speed (opt back in with `--beam-size N`).
+- **VRAM levers.** Biggest: `--asr-quant q8_0` (halves weight memory, also faster)
+  and dropping `--aligner` when you don't need word timestamps (−~1.8 GB). To trim
+  the resident compute buffer in `--mode vad`, lower `--vad-max-segment` (caps the
+  longest speech chunk). See [CPP_VS_PYTHON.md](CPP_VS_PYTHON.md) for a full VRAM
+  breakdown and the C++-vs-Python comparison.
+
 | Config | 30 s clip | Realtime factor |
 |--------|-----------|-----------------|
-| 1.7B q8, RTX 4090 (CUDA) | ~5.9 s | **~5×** |
+| 1.7B q8, RTX 4090, **greedy** | ~1.5 s | **~20×** |
+| 1.7B f16, RTX 4090, greedy | ~1.9 s | ~16× |
+| 1.7B q8, RTX 4090, beam=5 *(old default)* | ~3.9 s | ~8× |
 | 1.7B q4_k, CPU (`GPU=off`) | ~280 s | ~0.1× |
 | 0.6B q4_k, CPU | ~140 s | ~0.2× |
+
+> GPU rows are **engine inference** time (model load ~2–3 s excluded); q8 is both
+> fastest and smallest (it's bandwidth-bound, so 1-byte q8 beats 2-byte f16). CPU
+> rows are approximate end-to-end. See [CPP_VS_PYTHON.md](CPP_VS_PYTHON.md) for
+> beam-vs-greedy, C++-vs-Python, and VRAM benchmarks (30 s clip + 96 min film).
 
 > A harmless `ggml_cuda_init: CUDA minor version mismatch — compiled 12.0, runtime
 > 12.9` warning appears because apt's toolkit is 12.0 while the driver is 12.9;

@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <vector>
 
 #include "audio_decode.h"
@@ -60,6 +61,12 @@ struct Args {
     std::string aligner_quant = "q8_0"; // quantization config for the aligner
     int threads = 4;
     bool split_on_punct = true;         // nicer subtitle line breaks
+    int beam_size = 1;                  // 1 = greedy (fast, matches PyTorch default).
+                                        // >1 = beam search: ~Nx the decode work and
+                                        // it defeats CUDA-graph reuse, so the engine's
+                                        // own default of 5 is far slower for ~no
+                                        // accuracy gain on clean ASR. Opt in with
+                                        // --beam-size N if you need it.
 
     // --- segmentation / streaming ---
     std::string mode = "offline";       // offline | fixed | vad
@@ -70,6 +77,11 @@ struct Args {
     double vad_threshold = -1.0;        // vad mode: speech prob threshold (<0 -> default)
     int vad_min_silence_ms = -1;        // vad mode: min silence to cut (<0 -> default)
     int vad_min_speech_ms = -1;         // vad mode: min speech to keep (<0 -> default)
+    double vad_max_segment = 0.0;       // vad mode: cap each speech chunk (s); 0 ->
+                                        // fall back to --segment-seconds (unchanged
+                                        // default). Shorter caps shrink the resident
+                                        // worst-case compute buffer -> less VRAM, at
+                                        // some accuracy cost near segment edges.
 
     // --- approach C: per-segment live + forced aligner (linked C-ABI) ---
     bool aligned = false;               // fixed/vad: align each segment for accurate timing
@@ -104,6 +116,9 @@ void usage(const char * prog) {
         "      --backend <name>   force backend: qwen3 | qwen3-1.7b (default: auto-detect)\n"
         "  -l, --language <code>  language hint (en, zh, ko, ...); default: auto\n"
         "  -t, --threads <n>      inference threads (default 4)\n"
+        "  -bs, --beam-size <n>   decode beam width; 1 = greedy (default, fast).\n"
+        "                         >1 enables beam search: ~Nx slower decode for little\n"
+        "                         ASR accuracy gain. Use only if you need it.\n"
         "      --no-split         do not split subtitle lines on punctuation\n"
         "      --ffmpeg <path>    ffmpeg executable (default: ffmpeg on PATH)\n"
         "      --crispasr <path>  crispasr engine binary (default: vendored build)\n"
@@ -121,6 +136,9 @@ void usage(const char * prog) {
         "      --vad-threshold <f>   vad-mode speech threshold 0..1 (default ~0.5)\n"
         "      --min-silence-ms <n>  vad-mode silence to split a segment\n"
         "      --min-speech-ms <n>   vad-mode minimum speech to keep\n"
+        "      --vad-max-segment <s> vad+aligned: cap each speech chunk (s); 0 (default)\n"
+        "                            uses --segment-seconds. Lower = less VRAM, slight\n"
+        "                            accuracy cost near segment edges.\n"
         "      --json             streaming: emit --stream-json partial/final events\n"
         "      --realtime         pace input at 1x (simulate a live source)\n"
         "      --aligned          fixed/vad: per-segment forced-aligner pass for accurate\n"
@@ -166,12 +184,14 @@ bool parse_args(int argc, char ** argv, Args & a) {
         else if (arg == "--vad-threshold") { if (!need("--vad-threshold")) return false; a.vad_threshold = std::atof(v); }
         else if (arg == "--min-silence-ms") { if (!need("--min-silence-ms")) return false; a.vad_min_silence_ms = std::atoi(v); }
         else if (arg == "--min-speech-ms") { if (!need("--min-speech-ms")) return false; a.vad_min_speech_ms = std::atoi(v); }
+        else if (arg == "--vad-max-segment") { if (!need("--vad-max-segment")) return false; a.vad_max_segment = std::atof(v); }
         else if (arg == "--json") a.stream_json = true;
         else if (arg == "--realtime") a.realtime = true;
         else if (arg == "--aligned") a.aligned = true;
         else if (arg == "--vad-model") { if (!need("--vad-model")) return false; a.vad_model = v; }
         else if (arg == "-l" || arg == "--language" || arg == "--lang") { if (!need("--language")) return false; a.language = v; }
         else if (arg == "-t" || arg == "--threads") { if (!need("--threads")) return false; a.threads = std::atoi(v); }
+        else if (arg == "-bs" || arg == "--beam-size") { if (!need("--beam-size")) return false; a.beam_size = std::atoi(v); }
         else if (arg == "--no-split") a.split_on_punct = false;
         else if (arg == "--ffmpeg") { if (!need("--ffmpeg")) return false; a.ffmpeg = v; }
         else if (arg == "--crispasr") { if (!need("--crispasr")) return false; a.crispasr = v; }
@@ -331,6 +351,7 @@ std::vector<std::string> crispasr_stream_argv(const Args & a) {
                                   "-t", std::to_string(a.threads)};
     if (!a.backend.empty()) { v.push_back("--backend"); v.push_back(a.backend); }
     if (!a.language.empty()) { v.push_back("-l"); v.push_back(a.language); }
+    v.push_back("-bs"); v.push_back(std::to_string(a.beam_size));
     if (a.stream_json) v.push_back("--stream-json");
 
     if (a.mode == "vad") {
@@ -394,6 +415,7 @@ int run_offline(Args & a) {
     });
     if (!a.aligner.empty()) { cmd.push_back("-am"); cmd.push_back(a.aligner); }
     if (!a.language.empty()) { cmd.push_back("-l"); cmd.push_back(a.language); }
+    cmd.push_back("-bs"); cmd.push_back(std::to_string(a.beam_size));
     if (a.split_on_punct && out.ext != "txt") cmd.push_back("-sp");
 
     std::fprintf(stderr, "[2/2] transcribing with %s (backend=%s)...\n",
@@ -517,10 +539,21 @@ int run_aligned(Args & a) {
         return 1;
     }
 
+    // Phase timers (printed at the end when QASR_TIMING is set). Lets us report
+    // transcribe+align time without the decode / model-load / VAD overhead.
+    using clk = std::chrono::steady_clock;
+    auto secs = [](clk::time_point a, clk::time_point b) {
+        return std::chrono::duration<double>(b - a).count();
+    };
+    const bool timing = std::getenv("QASR_TIMING") != nullptr;
+    double t_decode = 0, t_load = 0, t_vad = 0, t_transcribe = 0, t_align = 0;
+
     // 1) Decode whole file -> in-memory 16 kHz mono PCM via external ffmpeg.
     std::fprintf(stderr, "[decode] %s via ffmpeg...\n", a.input.c_str());
+    auto tk = clk::now();
     std::vector<float> pcm;
     qasr::DecodeStatus dec = qasr::decode_to_samples(a.input, pcm, a.ffmpeg);
+    t_decode = secs(tk, clk::now());
     if (!dec.ok || pcm.empty()) {
         std::fprintf(stderr, "error: decode failed: %s\n", dec.error.c_str());
         return 1;
@@ -531,10 +564,12 @@ int run_aligned(Args & a) {
     // 2) Load ASR + aligner ONCE (resident across all segments).
     std::fprintf(stderr, "[load] ASR=%s  aligner=%s (loaded once)\n",
                  a.model.c_str(), a.aligner.c_str());
+    tk = clk::now();
     crispasr_session * sess = crispasr_session_open(a.model.c_str(), a.threads);
     if (!sess) { std::fprintf(stderr, "error: failed to open ASR session\n"); return 1; }
     crispasr_paligner * aln = crispasr_paligner_open(a.aligner.c_str(), a.threads);
     if (!aln) { std::fprintf(stderr, "error: failed to open aligner\n"); crispasr_session_close(sess); return 1; }
+    t_load = secs(tk, clk::now());
 
     // 3) Build segments (sample ranges).
     std::vector<std::pair<int,int>> segs;  // (start, n)
@@ -546,12 +581,17 @@ int run_aligned(Args & a) {
             crispasr_paligner_close(aln); crispasr_session_close(sess); return 1;
         }
         float * spans = nullptr;
+        tk = clk::now();
+        // Per-chunk cap: dedicated --vad-max-segment if set (>0), else the shared
+        // --segment-seconds (unchanged default). Bounds the longest segment, which
+        // sizes the resident worst-case compute buffer (VRAM).
+        const double vad_cap = a.vad_max_segment > 0.0 ? a.vad_max_segment : a.segment_seconds;
         int n = crispasr_vad_slices(vm.c_str(), pcm.data(), total, SR,
                                     a.vad_threshold,                       // <=0 -> model default
                                     a.vad_min_speech_ms >= 0 ? a.vad_min_speech_ms : 250,
                                     a.vad_min_silence_ms >= 0 ? a.vad_min_silence_ms : 100,
                                     30,                                    // speech pad ms
-                                    a.segment_seconds,                     // cap each chunk
+                                    vad_cap,                               // cap each chunk
                                     a.threads, &spans);
         for (int i = 0; i < n; ++i) {
             int s0 = static_cast<int>(spans[2*i] * SR);
@@ -560,6 +600,7 @@ int run_aligned(Args & a) {
             s1 = std::max(s0, std::min(s1, total));
             if (s1 > s0) segs.emplace_back(s0, s1 - s0);
         }
+        t_vad = secs(tk, clk::now());
         if (spans) crispasr_vad_free(spans);
         std::fprintf(stderr, "[vad] %zu speech segments\n", segs.size());
     } else {  // fixed
@@ -585,7 +626,9 @@ int run_aligned(Args & a) {
         const float * p = pcm.data() + segs[si].first;
         int n = segs[si].second;
 
+        tk = clk::now();
         crispasr_session_result * r = crispasr_session_transcribe(sess, p, n);
+        t_transcribe += secs(tk, clk::now());
         std::string text;
         if (r) {
             int nseg = crispasr_session_result_n_segments(r);
@@ -607,8 +650,10 @@ int run_aligned(Args & a) {
             std::vector<const char *> wptr(words.size());
             for (size_t i = 0; i < words.size(); ++i) wptr[i] = words[i].c_str();
             std::vector<int64_t> t0(words.size()), t1(words.size());
+            tk = clk::now();
             int arc = crispasr_paligner_align(aln, wptr.data(), static_cast<int>(words.size()),
                                               p, n, off_cs, t0.data(), t1.data());
+            t_align += secs(tk, clk::now());
             if (arc == 0) { cue_t0 = t0.front(); cue_t1 = t1.back(); }
         }
         if (cue_t1 <= cue_t0) cue_t1 = cue_t0 + 50;  // guard
@@ -630,6 +675,17 @@ int run_aligned(Args & a) {
     if (out != stdout) { std::fclose(out); std::fprintf(stderr, "wrote %s\n", a.output.c_str()); }
     crispasr_paligner_close(aln);
     crispasr_session_close(sess);
+
+    if (timing) {
+        const double audio_s = (double)total / SR;
+        const double infer = t_transcribe + t_align;
+        std::fprintf(stderr,
+            "[timing] audio=%.1fs | decode=%.2fs load=%.2fs vad=%.2fs "
+            "transcribe=%.2fs align=%.2fs | INFERENCE(transcribe+align)=%.2fs "
+            "(%.1fx realtime)\n",
+            audio_s, t_decode, t_load, t_vad, t_transcribe, t_align, infer,
+            infer > 0 ? audio_s / infer : 0.0);
+    }
     return 0;
 }
 
